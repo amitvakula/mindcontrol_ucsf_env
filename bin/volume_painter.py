@@ -1,11 +1,10 @@
 #!/usr/bin/env python
+
+# dependencies
 import pymongo
 import nibabel as nib
-from pbr.config import config as cc
 from os.path import join, exists, split
 from dipy.tracking import utils
-import argparse
-from nipype.utils.filemanip import load_json
 import os
 import numpy as np
 from dipy.tracking.utils import subsegment
@@ -16,7 +15,18 @@ def get_collection(port=3001):
     db =  client.meteor
     collection = db.subjects
     return collection, client
-    
+
+def get_segmentation_mask(db, subject_id="mse65"):
+    cursor = db.find({"subject_id":subject_id, "entry_type":"freesurfer"})
+    results = []
+    for item in cursor:
+        results.append(item)
+    assert len(results) == 1, "more than one result! either modify the code or restrict your query Amit"
+    subject = results[0]
+    DATA_HOME = "/data/henry7/PBR/subjects/"
+    subject["check_masks"][1]
+    return nib.load(DATA_HOME + subject["check_masks"][1])
+
 def get_papaya_aff(img):
     vs = img.header.get_zooms()
     aff = img.get_affine()
@@ -26,97 +36,42 @@ def get_papaya_aff(img):
         papaya_aff[line[0],i] = vs[i]*line[1]
     papaya_aff[:, 3] = aff[:, 3]
     return papaya_aff
-    
-
-def convert_to_volume(drawing, papaya_aff, aff, img, do_subsegment = True):
-
-    topoints = lambda x : np.array([[m["x"], m["y"], m["z"]] for m in x["world_coor"]])
-    points_orig = list(map(topoints, drawing))
-    if do_subsegment:
-        points = list(subsegment(points_orig, 0.5))
-    else:
-        points = points_orig
-    mask2 = utils.density_map(points, img.shape, affine=papaya_aff)
-    points_nifti_space = list(utils.move_streamlines(points, aff, input_space=papaya_aff))
-    mask1 = utils.density_map(points_nifti_space, img.shape, affine=aff)
-
-    #print((mask1 == mask2).all())
-    # img1 = nib.Nifti1Image(mask1)
-    #print(mask1.sum(), mask2.sum())
-    
-    return mask1, points_nifti_space
 
 def convert_to_indices(streamline, papaya_aff, aff, img):
+    #print(streamline)
     topoints = lambda x : np.array([[m["x"], m["y"], m["z"]] for m in x["world_coor"]])
     points_orig = topoints(streamline)
     points_nifti_space = list(utils.move_streamlines([points_orig], aff, input_space=papaya_aff))[0]
     from dipy.tracking._utils import _to_voxel_coordinates, _mapping_to_voxel
     lin_T, offset = _mapping_to_voxel(aff, None)
-    idx = _to_voxel_coordinates(streamline, lin_T, offset)
+    idx = _to_voxel_coordinates(points_orig, lin_T, offset)
     return points_nifti_space, idx
 
-def create_volume(output):
-    from pbr.config import config as cc
-    img = nib.load(join(cc["output_directory"],output["check_masks"][0]))
-    aff = img.get_affine() #affine()
-    papaya_affine = get_papaya_aff(img)
-    data = np.zeros(img.shape)
-    outputfiles = []
-    mse = output["subject_id"]
-    sequence = output["name"]
-    for contour in output["contours"]:
-        drawing = contour["contours"]
-        name = contour['name'].replace(" ", "_")
-        author = contour["checkedBy"]
-    
-        mask, points_nifti_space = convert_to_volume(drawing, papaya_affine, aff, img)
-        outfilepath = join(mse, "mindcontrol/{}/{}/rois".format(sequence, output["entry_type"]))
-        if not exists(join(cc["output_directory"], outfilepath)):
-            os.makedirs(join(cc["output_directory"],outfilepath))
-            print(join(cc["output_directory"], outfilepath), "created")
-        outfilename = join(outfilepath, "{}-{}.nii.gz".format(name,author))
-        nib.Nifti1Image(mask.astype(np.float32), affine=aff).to_filename(join(cc["output_directory"], outfilename))
-        
-        print("wrote", join(cc["output_directory"], outfilename))
-        outputfiles.append(outfilename)
-
-        if (papaya_affine == aff).all():
-            print("affines are the same")
-        else:
-            print(papaya_affine - aff)
-
-        mask, points_nifti_space = convert_to_volume(drawing, aff, aff, img)
-        outfilename2 = outfilename.replace(".nii.gz", "_origAff.nii.gz")
-        nib.Nifti1Image(mask.astype(np.float32), affine=aff).to_filename(join(cc["output_directory"], outfilename2))
-        print("wrote", join(cc["output_directory"], outfilename2))
-        outputfiles.append(outfilename2)
-
-    return outputfiles
-
-def paintVolume(drawing, papaya_affine, aff, img, outfilepath, name, authors, suffix=""):
+# the actual paint function (put helper functions above where I convert to the right space?)
+def get_points_to_paint(drawing, papaya_affine, aff, img, outfilepath, name, authors, suffix=""):
     import pandas as pd
     df = pd.DataFrame()
 
-    for i,d in enumerate(drawing):
+    for d in drawing:
         pv = d["paintValue"]
-        mask_tmp, points_nii_space = convert_to_volume([d], papaya_affine, aff, img, False)
-        nii_points = points_nii_space[0]
+        points_nii_space, trans_points = convert_to_indices(d, papaya_affine, aff, img)
         tmp = []
-        for ni in nii_points:
+        for ni in trans_points:
             tmp.append({"x": ni[0], "y":ni[1], "z": ni[2], "val": pv})
         df = df.append(pd.DataFrame(tmp), ignore_index=True)
     df.drop_duplicates(inplace=True)
-    if not exists(join(cc["output_directory"], outfilepath)):
-        os.makedirs(join(cc["output_directory"],outfilepath))
-        print(join(cc["output_directory"], outfilepath), "created")
-    outfilename = join(outfilepath, "{}-{}{}.csv".format(name,"-".join(authors), suffix))
+    #if not exists(join(cc["output_directory"], outfilepath)):
+        #os.makedirs(join(cc["output_directory"],outfilepath))
+        #print(join(cc["output_directory"], outfilepath), "created")
+    #outfilename = join(outfilepath, "{}-{}{}.csv".format(name,"-".join(authors), suffix))
     #nib.Nifti1Image(mask.astype(np.float32), affine=aff).to_filename(join(cc["output_directory"], outfilename))
-    df.to_csv(join(cc["output_directory"], outfilename))
-    return outfilename
+    #df.to_csv(join(cc["output_directory"], outfilename))
+    #return outfilename
+    return df
 
-def create_paint_volume(output):
-    from pbr.config import config as cc
-    img = nib.load(join(cc["output_directory"],output["check_masks"][-1]))
+def create_paint_volume(drawing, img, output, outfilepath):
+    #from pbr.config import config as cc
+    #img = nib.load(join(cc["output_directory"],output["check_masks"][-1]))
     aff = img.get_affine() #affine()
     papaya_affine = get_papaya_aff(img)
     data = np.zeros(img.shape)
@@ -125,129 +80,45 @@ def create_paint_volume(output):
     sequence = output["name"]
     #for c in output["contours"]:
     drawing_old = output["painters"]
-    drawing = []
-    for p in drawing_old:
-        if len(p["world_coor"]):
-            drawing.append(p)
+    #drawing = []
+    #for p in drawing_old:
+    #    if len(p["world_coor"]):
+    #        drawing.append(p)
 
     name = output["entry_type"] #contour['name'].replace(" ", "_")
     authors = set([q["checkedBy"] for q in drawing])
 
+    data = img.get_data() + data
+    
+    df = get_points_to_paint(drawing, papaya_affine, aff, img, outfilepath, name, authors, suffix="")
+    for item in df.iterrows():
+        paint_value = item[1]['val']
+        x,y,z = item[1]['x'], item[1]['y'], item[1]['z']
+        data[x][y][z] = paint_value
+    
+    painted_image = nib.nifti1.Nifti1Image(data,aff,img.header)
+    
+    nib.save(painted_image,os.path.join(outfilepath,"painted.nii.gz"))
+    
+        
     #mask, points_nifti_space = convert_to_volume(drawing, papaya_affine, aff, img, False)
 
-    outfilepath = join(mse, "mindcontrol/{}/{}/rois".format(sequence, output["entry_type"]))
+    #outfilepath = join(mse, "mindcontrol/{}/{}/rois".format(sequence, output["entry_type"]))
 
-    outfilename = paintVolume(drawing, papaya_affine, aff, img, outfilepath, name, authors)
-    print("painter wrote", join(cc["output_directory"], outfilename))
-    outputfiles.append(outfilename)
+    #papaya_aff_points = paintVolume(drawing, papaya_affine, aff, img, outfilepath, name, authors)
+    #print("painter wrote", join(cc["output_directory"], outfilename))
+    #outputfiles.append(outfilename)
 
-    outfilename = paintVolume(drawing, aff, aff, img, outfilepath, name, authors, suffix="_origAff")
-    print("painter wrote", join(cc["output_directory"], outfilename))
-    outputfiles.append(outfilename)
-    return outputfiles
+    #aff_points = paintVolume(drawing, aff, aff, img, outfilepath, name, authors, suffix="_origAff")
+    #print("painter wrote", join(cc["output_directory"], outfilename))
+    #outputfiles.append(outfilename)
+    
+    #to_rtn = paint_over()
+    
+    return painted_image
 
 
-def convert_to_real_world(drawing, papaya_aff, aff, img):
-
-    topoints = lambda x : np.array([[m["world_coor"]["x"],
-                                     m["world_coor"]["y"],
-                                     m["world_coor"]["z"]] for m in x])
-    points_orig = topoints(drawing)
-    #print(points_orig)
-    points_nifti_space = list(utils.move_streamlines(points_orig, aff, input_space=papaya_aff))
-    mask1 = utils.density_map(points_nifti_space, img.shape, affine=aff)
-    return mask1, points_nifti_space
-
-def create_points_df(entry, points_nii_space, suffix=""):
-    import pandas as pd
-    df = pd.DataFrame(points_nii_space, columns=["x","y","z"])
-    annot = []
-    authors = []
-    for e in entry["loggedPoints"]:
-        authors.append(e["checkedBy"])
-        if "note" in entry.keys():
-            annot.append(e["note"])
-        else:
-            annot.append(None)
-    df["annotation"] = annot
-    df["author"] = authors
-    mse = entry["subject_id"]
-    sequence = entry["name"]
-    outfilepath = join(mse, "mindcontrol/{}/{}/rois".format(sequence, entry["entry_type"]))
-    if not exists(join(cc["output_directory"], outfilepath)):
-        os.makedirs(join(cc["output_directory"],outfilepath))
-        print(join(cc["output_directory"], outfilepath), "created")
-    author = "-".join(set(authors))
-    outfilename = join(outfilepath, "{}-{}{}.csv".format(entry["name"], author, suffix))
-    df.to_csv(join(cc["output_directory"], outfilename))
-    return join(cc["output_directory"], outfilename)
-
-def get_all_seeds(mse, meteor_port, entry_types=None):
-    import pandas as pd
-    coll, cli = get_collection(meteor_port+1)
-    finder = {"subject_id": mse}
-    if entry_types is not None:
-        finder["entry_type"] = {"$in": entry_types}
-    entries = coll.find(finder)
-    saved = []
-    for entry in entries:
-        if "name" in entry.keys(): #i.e. there needs to be a sequence associated w/ the ROI
-            name = entry["name"]
-            et = entry["entry_type"]
-            sid = entry["subject_id"]
-            if "loggedPoints" in entry.keys():
-                img = nib.load(join(cc["output_directory"],entry["check_masks"][0]))
-                aff = img.get_affine() #affine()
-                papaya_affine = get_papaya_aff(img)
-                mask1, points_nii_space = convert_to_real_world(entry["loggedPoints"], papaya_affine,
-                                                                aff, img)
-                outfilename = create_points_df(entry, points_nii_space)
-                print("wrote", outfilename)
-                mask2, points_nii_space2 = convert_to_real_world(entry["loggedPoints"], aff,
-                                                                aff, img)
-                outfilename2 = create_points_df(entry, points_nii_space2)
-                print("write", outfilename2)
-
-def get_all_contours(mse, meteor_port, entry_types = None):
-    coll, cli = get_collection(meteor_port+1)
-    finder = {"subject_id": mse}
-    if entry_types is not None:
-        finder["entry_type"] = {"$in": entry_types}
-    entries = coll.find(finder)
-    saved = []
-    for entry in entries: 
-        if "name" in entry.keys(): #i.e. there needs to be a sequence associated w/ the ROI
-            name = entry["name"]
-            et = entry["entry_type"]
-            sid = entry["subject_id"]
-            if "contours" in entry.keys():
-                print("found drawings for", name, et, sid)
-                outputs = create_volume(entry)
-                if outputs:
-                    for o in outputs:
-                        if not o in entry["check_masks"]:
-                            entry["check_masks"].append(o)
-                    coll.update_one({"name": name, "subject_id":sid, "entry_type": et},
-                                    {"$set":{"check_masks": entry["check_masks"]}})
-            
-
-def get_all_paints(mse, meteor_port, entry_types = None):
-    coll, cli = get_collection(meteor_port+1)
-    finder = {"subject_id": mse}
-    if entry_types is not None:
-        finder["entry_type"] = {"$in": entry_types}
-    entries = coll.find(finder)
-    saved = []
-    for entry in entries:
-        if "name" in entry.keys(): #i.e. there needs to be a sequence associated w/ the ROI
-            name = entry["name"]
-            et = entry["entry_type"]
-            sid = entry["subject_id"]
-            if "painters" in entry.keys():
-                print("found paintings for", name, et, sid)
-                outputs = create_paint_volume(entry)
-
-if __name__ == '__main__':
+if __name__ == 'IGNORE':
     parser = argparse.ArgumentParser()
     parser.add_argument('-e', '--env', dest="env")
     parser.add_argument("-s", dest="subjects", nargs="+")
@@ -278,4 +149,24 @@ if __name__ == '__main__':
     else:
         raise Exception("Choose the database you want to append to w/ -e production or -e development")
 
+if __name__ == "__main__":
+    collection, client = get_collection(5051)
+    seg_mask = get_segmentation_mask(collection, subject_id="mse65")
     
+    # getting painter object
+    cursor = collection.find({"subject_id":"mse65", "entry_type":"lst"})
+    results = []
+    for item in cursor:
+        results.append(item)
+    assert len(results) == 1, "more than one result! either modify the code or restrict your query Amit"
+    painter_entry = results[0]
+    modified_segmentation = create_paint_volume([painter_entry['painters'][0]], seg_mask, painter_entry, "/Users/amitvakula/Documents/research/results")
+
+
+
+    diff_map = seg_mask.get_data() - modified_segmentation.get_data()
+    for i in range(np.shape(diff_map)[0]):
+        for j in range(np.shape(diff_map)[1]):
+            for k in range(np.shape(diff_map)[2]):
+                if diff_map[i][j][k] != 0:
+                    print("at {} we got value {}".format((i,j,k),diff_map[i][j][k]))
